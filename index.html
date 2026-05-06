@@ -3047,9 +3047,8 @@ function renderDiscountsAll() {
 // ================== INTEGRACIÓN API DE ANTHROPIC ==================
 // Llama a la Netlify Function que actúa como proxy seguro a la API de Anthropic.
 
-async function callAI(prompt) {
+async function callAI(prompt, onChunk) {
   // Endpoint relativo: funciona en Netlify deploy real
-  // Si estás en localhost o file://, va a fallar (no hay function levantada)
   const endpoint = '/.netlify/functions/regenerar';
   let response;
   try {
@@ -3062,12 +3061,12 @@ async function callAI(prompt) {
     throw new Error(`No hay conexión a internet o el servidor no responde. Detalle: ${networkErr.message}`);
   }
 
-  // Detectar 404 específicamente: function no deployada
+  // Detectar 404
   if (response.status === 404) {
-    throw new Error(`La función /.netlify/functions/regenerar no existe en el servidor (404). Esto significa que la carpeta netlify/functions/regenerar.js no se subió correctamente. Andá a tu sitio en Netlify → Functions y verificá si aparece "regenerar" en la lista. Si no aparece, hay que volver a subir el zip asegurando que la carpeta netlify/ esté incluida.`);
+    throw new Error(`La función /.netlify/functions/regenerar no existe en el servidor (404). Verificá que la carpeta netlify/functions/regenerar.js esté en el repo.`);
   }
 
-  // Si la respuesta no es OK, intentamos sacar el mensaje de error
+  // Si no es OK y NO es streaming, viene un error JSON
   if (!response.ok) {
     let errMsg = `HTTP ${response.status}`;
     let errDetails = '';
@@ -3076,7 +3075,6 @@ async function callAI(prompt) {
       errMsg = errData.error || errMsg;
       errDetails = errData.details ? ` (${errData.details})` : '';
     } catch (parseErr) {
-      // No vino JSON, intentamos como texto
       try {
         const text = await response.text();
         if (text) errMsg += `: ${text.slice(0, 200)}`;
@@ -3085,29 +3083,78 @@ async function callAI(prompt) {
     throw new Error(errMsg + errDetails);
   }
 
-  // Respuesta OK
-  let data;
-  try {
-    data = await response.json();
-  } catch (parseErr) {
-    throw new Error('La respuesta del servidor no es JSON válido. Probablemente la function falló silenciosamente.');
+  // Procesar el stream NDJSON (newline-delimited JSON)
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+  let usage = null;
+  let streamError = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type === 'delta') {
+          fullText += event.text;
+          if (onChunk) onChunk(fullText, event.text);
+        } else if (event.type === 'done') {
+          usage = event.usage;
+        } else if (event.type === 'error') {
+          streamError = event.error;
+        }
+      } catch (parseErr) {
+        console.warn('Could not parse line:', line);
+      }
+    }
   }
-  return data;
+
+  if (streamError) {
+    throw new Error('Error durante el streaming: ' + streamError);
+  }
+
+  return { content: fullText, usage };
 }
 
-// Mostrar UI de progreso
+// Mostrar UI de progreso (con área para texto en streaming)
 function showAIProgress(title, subtitle) {
   const html = `
     <h2 style="font-size:18px;font-weight:600;margin-bottom:4px">${title}</h2>
     <p style="font-size:12px;color:var(--text-3);margin-bottom:14px">${subtitle}</p>
-    <div class="ai-progress">
+    <div class="ai-progress" id="ai-progress-bar">
       <div class="spinner"></div>
-      <div class="ai-progress-text">Esperando respuesta de Claude…<br><span style="font-size:11px;font-weight:400;opacity:0.8">Esto puede tardar 30-60 segundos</span></div>
+      <div class="ai-progress-text">Esperando respuesta de Claude…<br><span style="font-size:11px;font-weight:400;opacity:0.8" id="ai-progress-meta">Conectando…</span></div>
     </div>
+    <div class="ai-response-content" id="ai-stream-text" style="display:none;max-height:50vh"></div>
   `;
   document.getElementById('modal-content').innerHTML = html;
   document.getElementById('modal').classList.add('show');
   document.body.style.overflow = 'hidden';
+}
+
+// Actualizar el texto que llega por streaming
+function updateAIStream(fullText) {
+  const el = document.getElementById('ai-stream-text');
+  const meta = document.getElementById('ai-progress-meta');
+  if (!el) return;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+  }
+  el.textContent = fullText;
+  // Auto-scroll al final
+  el.scrollTop = el.scrollHeight;
+  // Actualizar meta con cantidad de caracteres
+  if (meta) {
+    meta.textContent = `Recibiendo… ${fullText.length} caracteres`;
+  }
 }
 
 // Mostrar respuesta de la IA
@@ -3179,7 +3226,9 @@ async function autoRegenerate() {
   showAIProgress('🔄 Regenerando menú', 'Claude va a generar 2 semanas de menú nuevo según tus preferencias.');
   try {
     const prompt = buildPrompt();
-    const result = await callAI(prompt);
+    const result = await callAI(prompt, (fullText) => {
+      updateAIStream(fullText);
+    });
     showAIResponse('🍽️ Menú nuevo generado', result.content, {
       usage: result.usage,
       applyLabel: '✓ Marcar como regenerado',
@@ -3214,7 +3263,9 @@ async function autoPlan() {
   showAIProgress('📅 Armando plan semanal', 'Claude va a armar 7 días con lo que tenés en casa.');
   try {
     const prompt = buildPlanPrompt();
-    const result = await callAI(prompt);
+    const result = await callAI(prompt, (fullText) => {
+      updateAIStream(fullText);
+    });
     showAIResponse('📅 Plan semanal con tus ingredientes', result.content, { usage: result.usage });
   } catch (err) {
     showAIError('armar el plan semanal', err);
@@ -3239,7 +3290,9 @@ async function autoCombinar() {
   showAIProgress('✨ Inventando receta', 'Claude va a combinar tus ingredientes en una receta nueva.');
   try {
     const prompt = buildCombinarPrompt();
-    const result = await callAI(prompt);
+    const result = await callAI(prompt, (fullText) => {
+      updateAIStream(fullText);
+    });
     showAIResponse('✨ Receta nueva con lo que tenés', result.content, { usage: result.usage });
   } catch (err) {
     showAIError('crear la receta', err);
