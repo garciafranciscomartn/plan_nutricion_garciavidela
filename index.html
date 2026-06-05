@@ -3564,4 +3564,362 @@ function renderDiscountsAll() {
 
 async function callAI(prompt, onChunk) {
   // Endpoint relativo: funciona en Netlify deploy real
-  co
+  const endpoint = '/.netlify/functions/regenerar';
+  let response;
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, sessionId: syncSessionId })
+    });
+  } catch (networkErr) {
+    throw new Error(`No hay conexión a internet o el servidor no responde. Detalle: ${networkErr.message}`);
+  }
+
+  // Detectar 404
+  if (response.status === 404) {
+    throw new Error(`La función /.netlify/functions/regenerar no existe en el servidor (404). Verificá que la carpeta netlify/functions/regenerar.js esté en el repo.`);
+  }
+
+  // Si no es OK y NO es streaming, viene un error JSON
+  if (!response.ok) {
+    let errMsg = `HTTP ${response.status}`;
+    let errDetails = '';
+    try {
+      const errData = await response.json();
+      errMsg = errData.error || errMsg;
+      errDetails = errData.details ? ` (${errData.details})` : '';
+    } catch (parseErr) {
+      try {
+        const text = await response.text();
+        if (text) errMsg += `: ${text.slice(0, 200)}`;
+      } catch {}
+    }
+    throw new Error(errMsg + errDetails);
+  }
+
+  // Procesar el stream NDJSON (newline-delimited JSON)
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+  let usage = null;
+  let streamError = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type === 'delta') {
+          fullText += event.text;
+          if (onChunk) onChunk(fullText, event.text);
+        } else if (event.type === 'done') {
+          usage = event.usage;
+        } else if (event.type === 'error') {
+          streamError = event.error;
+        }
+      } catch (parseErr) {
+        console.warn('Could not parse line:', line);
+      }
+    }
+  }
+
+  if (streamError) {
+    throw new Error('Error durante el streaming: ' + streamError);
+  }
+
+  return { content: fullText, usage };
+}
+
+// Mostrar UI de progreso (con área para texto en streaming)
+function showAIProgress(title, subtitle) {
+  const html = `
+    <h2 style="font-size:18px;font-weight:600;margin-bottom:4px">${title}</h2>
+    <p style="font-size:12px;color:var(--text-3);margin-bottom:14px">${subtitle}</p>
+    <div class="ai-progress" id="ai-progress-bar">
+      <div class="spinner"></div>
+      <div class="ai-progress-text">Esperando respuesta de Claude…<br><span style="font-size:11px;font-weight:400;opacity:0.8" id="ai-progress-meta">Conectando…</span></div>
+    </div>
+    <div class="ai-response-content" id="ai-stream-text" style="display:none;max-height:50vh"></div>
+  `;
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+  document.body.style.overflow = 'hidden';
+}
+
+// Actualizar el texto que llega por streaming
+function updateAIStream(fullText) {
+  const el = document.getElementById('ai-stream-text');
+  const meta = document.getElementById('ai-progress-meta');
+  if (!el) return;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+  }
+  el.textContent = fullText;
+  // Auto-scroll al final
+  el.scrollTop = el.scrollHeight;
+  // Actualizar meta con cantidad de caracteres
+  if (meta) {
+    meta.textContent = `Recibiendo… ${fullText.length} caracteres`;
+  }
+}
+
+// Mostrar respuesta de la IA
+function showAIResponse(title, content, opts = {}) {
+  const usage = opts.usage;
+  const meta = usage
+    ? `Modelo: claude-sonnet-4-6 · ${usage.input_tokens} tokens entrada · ${usage.output_tokens} tokens salida · ~$${estimateCost(usage)}`
+    : '';
+  const html = `
+    <div class="ai-response-modal">
+      <h2>${title}</h2>
+      ${meta ? `<div class="ai-response-meta">${meta}</div>` : ''}
+      <div class="ai-response-content" id="ai-response-text">${escapeHtml(content)}</div>
+      <div class="ai-response-actions">
+        <button class="btn btn-primary" onclick="copyAIResponse()">📋 Copiar respuesta completa</button>
+        ${opts.onApply ? `<button class="btn btn-primary" id="apply-ai-btn">${opts.applyLabel || '✓ Aplicar a la app'}</button>` : ''}
+        <button class="btn" onclick="closeModal()">Cerrar</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+  document.body.style.overflow = 'hidden';
+  if (opts.onApply) {
+    document.getElementById('apply-ai-btn').onclick = opts.onApply;
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function copyAIResponse() {
+  const text = document.getElementById('ai-response-text')?.textContent || '';
+  navigator.clipboard.writeText(text).then(() => {
+    showToast('✓ Respuesta copiada');
+  }).catch(() => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('✓ Copiado');
+  });
+}
+
+// Estimar costo en USD basado en pricing de Sonnet 4.6 ($3/M input, $15/M output)
+function estimateCost(usage) {
+  if (!usage) return '0';
+  const cost = (usage.input_tokens * 3 / 1_000_000) + (usage.output_tokens * 15 / 1_000_000);
+  return cost.toFixed(3);
+}
+
+// === Acciones específicas ===
+
+async function autoRegenerate() {
+  if (familia.length === 0) {
+    showToast('Configurá al menos 1 integrante en Familia');
+    return;
+  }
+  const btn = document.getElementById('auto-regen-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Generando…';
+  }
+  showAIProgress('🔄 Regenerando menú', 'Claude va a generar 2 semanas de menú nuevo según tus preferencias.');
+  try {
+    const prompt = buildPrompt();
+    const result = await callAI(prompt, (fullText) => {
+      updateAIStream(fullText);
+    });
+    showAIResponse('🍽️ Menú nuevo generado', result.content, {
+      usage: result.usage,
+      applyLabel: '✓ Marcar como regenerado',
+      onApply: () => {
+        markRegenerated();
+        closeModal();
+      }
+    });
+  } catch (err) {
+    showAIError('regenerar el menú', err);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '⚡ Regenerar automático';
+    }
+  }
+}
+
+async function autoPlan() {
+  if (familia.length === 0) {
+    showToast('Configurá al menos 1 integrante en Familia');
+    return;
+  }
+  if ([...pantry, ...pantryExtras].length === 0) {
+    if (!confirm('No marcaste ingredientes en "¿Qué hay?". Claude no va a saber qué tenés en casa. ¿Continuar igual?')) return;
+  }
+  const btn = document.getElementById('auto-plan-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Generando…';
+  }
+  showAIProgress('📅 Armando plan semanal', 'Claude va a armar 7 días con lo que tenés en casa.');
+  try {
+    const prompt = buildPlanPrompt();
+    const result = await callAI(prompt, (fullText) => {
+      updateAIStream(fullText);
+    });
+    showAIResponse('📅 Plan semanal con tus ingredientes', result.content, { usage: result.usage });
+  } catch (err) {
+    showAIError('armar el plan semanal', err);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '⚡ Generar plan automático';
+    }
+  }
+}
+
+async function autoCombinar() {
+  if ([...pantry, ...pantryExtras].length === 0) {
+    showToast('Marcá al menos algunos ingredientes primero');
+    return;
+  }
+  const btn = document.getElementById('auto-combinar-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Generando…';
+  }
+  showAIProgress('✨ Inventando receta', 'Claude va a combinar tus ingredientes en una receta nueva.');
+  try {
+    const prompt = buildCombinarPrompt();
+    const result = await callAI(prompt, (fullText) => {
+      updateAIStream(fullText);
+    });
+    showAIResponse('✨ Receta nueva con lo que tenés', result.content, { usage: result.usage });
+  } catch (err) {
+    showAIError('crear la receta', err);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '⚡ Generar receta automática';
+    }
+  }
+}
+
+function showAIError(action, err) {
+  const msg = err.message || 'Error desconocido';
+  const isNetwork = msg.includes('fetch') || msg.includes('Network') || msg.includes('Failed');
+  const isAPI = msg.includes('API') || msg.includes('saldo') || msg.includes('key');
+
+  let helpText = '';
+  if (isNetwork) {
+    helpText = `<p style="font-size:13px;color:var(--text-2);line-height:1.5;margin-top:10px">Problema de conexión. Esto puede pasar si:</p>
+      <ul style="font-size:13px;color:var(--text-2);line-height:1.7;padding-left:20px">
+        <li>No hay internet</li>
+        <li>La app está corriendo localmente (sin Netlify deploy)</li>
+        <li>Las Netlify Functions no están configuradas</li>
+      </ul>`;
+  } else if (isAPI) {
+    helpText = `<p style="font-size:13px;color:var(--text-2);line-height:1.5;margin-top:10px">Problema con la API de Anthropic. Verificá:</p>
+      <ul style="font-size:13px;color:var(--text-2);line-height:1.7;padding-left:20px">
+        <li>Tu API key está bien configurada en Netlify (variable ANTHROPIC_API_KEY)</li>
+        <li>Tenés saldo en console.anthropic.com</li>
+        <li>La key no expiró o fue revocada</li>
+      </ul>`;
+  }
+
+  const html = `
+    <h2 style="font-size:18px;font-weight:600;margin-bottom:8px;color:var(--danger-text)">⚠️ Error al ${action}</h2>
+    <div style="background:var(--danger-bg);color:var(--danger-text);padding:12px;border-radius:var(--radius);font-size:13px;line-height:1.5">${escapeHtml(msg)}</div>
+    ${helpText}
+    <p style="font-size:12px;color:var(--text-3);margin-top:14px;line-height:1.5">Mientras tanto, podés usar el botón "📋 Copiar" para usar el prompt manualmente en Claude.ai.</p>
+    <button class="btn" onclick="closeModal()" style="width:100%;margin-top:14px">Cerrar</button>
+  `;
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+  document.body.style.overflow = 'hidden';
+}
+
+
+// Iniciar Firebase cuando esté listo
+function initSync() {
+  // Render UI inicial inmediatamente (no depende de Firebase)
+  renderSyncUI();
+  if (!window.fb) {
+    // Firebase aún no cargó — esperar
+    window.addEventListener('firebase-ready', () => {
+      renderSyncUI();
+      if (syncSessionId) subscribeToSession(syncSessionId);
+    }, { once: true });
+    // Timeout: si en 8 seg no cargó, mostrar mensaje
+    setTimeout(() => {
+      if (!window.fb) {
+        const statusCard = document.getElementById('sync-status-card');
+        if (statusCard && !syncSessionId) {
+          statusCard.className = 'sync-status-card error';
+          statusCard.innerHTML = `<span class="sync-status-icon">⚠️</span><div>No se pudo cargar Firebase. Verificá tu conexión y recargá.</div>`;
+        }
+      }
+    }, 8000);
+    return;
+  }
+  if (syncSessionId) {
+    subscribeToSession(syncSessionId);
+  }
+}
+
+// Refresh UI on connectivity changes
+window.addEventListener('online', renderSyncUI);
+window.addEventListener('offline', renderSyncUI);
+
+// Refresh UI status text every 30 seconds
+setInterval(() => {
+  if (syncSessionId) renderSyncUI();
+}, 30000);
+
+// ================== INIT ==================
+renderRegenChips();
+updatePromptPreview();
+renderRegenStatus();
+renderSeasonBanner();
+renderObjetivoPill();
+renderFamilyList();
+renderPantry();
+renderSuggestions();
+renderDiscountsAll();
+
+renderWeek();
+// Inicializar shopping mode desde localStorage
+setShoppingMode(shoppingMode);
+renderRecetas();
+renderBebe();
+
+const today = new Date().getDay();
+const todayMap = [6, 0, 1, 2, 3, 4, 5];
+if (todayMap[today] < 7) {
+  currentDay = todayMap[today];
+  renderDayTabs();
+  renderDay();
+}
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+initSync();
+</script>
+</body>
+</html>
