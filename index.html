@@ -66,6 +66,27 @@ body { padding-bottom: env(safe-area-inset-bottom); }
 .day-tab .day-num { font-size: 11px; opacity: 0.65; display: block; margin-bottom: 1px; }
 
 .meal-card { background: var(--surface); border: 0.5px solid var(--border); border-radius: var(--radius-lg); padding: 14px; margin-bottom: 10px; cursor: pointer; transition: all 0.15s; position: relative; }
+.meal-card.meal-selected { border-color: var(--accent); border-width: 1.5px; background: var(--accent-bg); }
+.meal-card-wrapper { display: flex; gap: 8px; align-items: stretch; margin-bottom: 10px; }
+.meal-card-wrapper > .meal-card { flex: 1; margin-bottom: 0; }
+.meal-select-btn { width: 32px; min-width: 32px; border: 1.5px dashed var(--border-2); border-radius: var(--radius); background: transparent; color: var(--text-3); font-size: 16px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.15s; flex-shrink: 0; font-family: inherit; }
+.meal-select-btn:active { transform: scale(0.92); }
+.meal-select-btn.selected { background: var(--accent); border-color: var(--accent); border-style: solid; color: white; }
+.meal-select-btn.selected:hover { background: #0a5d49; }
+
+/* Meal manager modal */
+.meal-manager-row { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border: 0.5px solid var(--border); border-radius: var(--radius); margin-bottom: 4px; cursor: pointer; transition: all 0.15s; }
+.meal-manager-row:active { transform: scale(0.99); }
+.meal-manager-row.selected { background: var(--accent-bg); border-color: var(--accent); }
+.meal-manager-check { width: 22px; height: 22px; min-width: 22px; border: 1.5px solid var(--border-2); border-radius: 5px; display: flex; align-items: center; justify-content: center; color: white; font-size: 14px; font-weight: 700; flex-shrink: 0; background: transparent; }
+.meal-manager-row.selected .meal-manager-check { background: var(--accent); border-color: var(--accent); }
+.meal-manager-info { flex: 1; min-width: 0; }
+.meal-manager-tag { font-size: 10px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+.meal-manager-text { font-size: 12px; color: var(--text-2); line-height: 1.4; }
+
+/* Mode toggle badge */
+#selected-count-badge { color: var(--accent); font-weight: 600; margin-left: 4px; }
+.mode-btn.active #selected-count-badge { color: white; }
 .meal-card:active { transform: scale(0.99); }
 .meal-card.has-recipe::after { content: "→"; position: absolute; right: 14px; top: 14px; color: var(--text-3); font-size: 16px; }
 .meal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
@@ -362,11 +383,32 @@ body { padding-bottom: env(safe-area-inset-bottom); }
   </div>
 
   <div id="compras" class="section">
-    <div class="note">📦 Lista optimizada: <strong>1 compra grande el lunes</strong> + <strong>1 chica el jueves</strong> (frescos).</div>
-    <div class="fab-row" style="margin-bottom:14px;">
-      <button class="btn" onclick="clearChecks()">Limpiar tildados</button>
-      <button class="btn" onclick="toggleWeekFilter()" id="filter-btn">Solo lunes</button>
+    <div class="mode-toggle">
+      <button class="mode-btn active" data-shop-mode="all" onclick="setShoppingMode('all')">🗓️ Semana completa</button>
+      <button class="mode-btn" data-shop-mode="selected" onclick="setShoppingMode('selected')">✓ Solo seleccionadas <span id="selected-count-badge"></span></button>
     </div>
+
+    <div id="all-mode-content">
+      <div class="note">📦 Lista optimizada para las 2 semanas: <strong>1 compra grande el lunes</strong> + <strong>1 chica el jueves</strong> (frescos).</div>
+      <div class="fab-row" style="margin-bottom:14px;">
+        <button class="btn" onclick="clearChecks()">Limpiar tildados</button>
+        <button class="btn" onclick="toggleWeekFilter()" id="filter-btn">Solo lunes</button>
+      </div>
+    </div>
+
+    <div id="selected-mode-content" style="display:none">
+      <div class="note">✨ Lista calculada según las comidas que seleccionaste del menú. Cantidades estimadas para tu familia.</div>
+
+      <div class="regen-card">
+        <h3 class="regen-title">Comidas seleccionadas</h3>
+        <div id="selected-meals-summary"></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn" onclick="openSelectedMealsManager()" style="flex:1">+ Agregar / Quitar comidas</button>
+          <button class="btn" onclick="clearAllSelectedMeals()" style="flex:1">Limpiar selección</button>
+        </div>
+      </div>
+    </div>
+
     <div id="compras-content"></div>
   </div>
 
@@ -983,6 +1025,306 @@ function findRecipeKeysFor(text) {
   return keys;
 }
 
+// ================== CÁLCULO DE INGREDIENTES POR COMIDA ==================
+// Map: texto del menú → array de ingredientes { item, qty, unit, category }
+// qty es por ADULTO. La función multiplica por integrantes.
+// unit: g, ml, unidades, taza, cda, cdita
+// category: para agrupar en la lista de compras
+
+// Definimos un catálogo de "platos base" con sus ingredientes
+const dishIngredients = {
+  // Desayunos
+  "huevos_revueltos":     [{item:"Huevos", qty:2, unit:"unidades", category:"🥩 Proteínas"}],
+  "huevos_palta":         [{item:"Huevos", qty:2, unit:"unidades", category:"🥩 Proteínas"}, {item:"Palta", qty:0.5, unit:"unidades", category:"🍎 Frutas"}],
+  "tostadas_integrales":  [{item:"Pan integral", qty:2, unit:"rebanadas", category:"🌾 Cereales y secos"}, {item:"Queso untable desc.", qty:30, unit:"g", category:"🥩 Proteínas"}],
+  "tostadas_palta":       [{item:"Pan integral", qty:2, unit:"rebanadas", category:"🌾 Cereales y secos"}, {item:"Palta", qty:0.5, unit:"unidades", category:"🍎 Frutas"}, {item:"Queso port salut light", qty:30, unit:"g", category:"🥩 Proteínas"}],
+  "tostadas_jamon_queso": [{item:"Pan integral", qty:2, unit:"rebanadas", category:"🌾 Cereales y secos"}, {item:"Jamón cocido natural", qty:30, unit:"g", category:"🥩 Proteínas"}, {item:"Queso port salut light", qty:30, unit:"g", category:"🥩 Proteínas"}],
+  "omelette_espinaca":    [{item:"Huevos", qty:2, unit:"unidades", category:"🥩 Proteínas"}, {item:"Espinaca fresca", qty:50, unit:"g", category:"🥬 Verduras"}, {item:"Queso untable desc.", qty:20, unit:"g", category:"🥩 Proteínas"}],
+  "omelette_jamon":       [{item:"Huevos", qty:2, unit:"unidades", category:"🥩 Proteínas"}, {item:"Jamón cocido natural", qty:30, unit:"g", category:"🥩 Proteínas"}, {item:"Queso untable desc.", qty:20, unit:"g", category:"🥩 Proteínas"}],
+  "omelette_champis":     [{item:"Huevos", qty:2, unit:"unidades", category:"🥩 Proteínas"}, {item:"Champiñones", qty:60, unit:"g", category:"🥬 Verduras"}, {item:"Queso untable desc.", qty:20, unit:"g", category:"🥩 Proteínas"}],
+  "yogur_frutillas":      [{item:"Yogur descremado", qty:1, unit:"unidades", category:"🥛 Lácteos adultos"}, {item:"Frutillas", qty:80, unit:"g", category:"🍎 Frutas"}],
+  "yogur_firme":          [{item:"Yogur firme descremado", qty:1, unit:"unidades", category:"🥛 Lácteos adultos"}, {item:"Almendras", qty:10, unit:"g", category:"🌾 Cereales y secos"}],
+  "pancake_avena":        [{item:"Avena instantánea", qty:30, unit:"g", category:"🌾 Cereales y secos"}, {item:"Huevos", qty:1, unit:"unidades", category:"🥩 Proteínas"}, {item:"Banana", qty:0.5, unit:"unidades", category:"🍎 Frutas"}],
+
+  // Colaciones / snacks
+  "manzana":              [{item:"Manzanas", qty:1, unit:"unidades", category:"🍎 Frutas"}],
+  "pera":                 [{item:"Peras (de estación)", qty:1, unit:"unidades", category:"🍎 Frutas"}],
+  "mandarina":            [{item:"Mandarinas (de estación)", qty:1, unit:"unidades", category:"🍎 Frutas"}],
+  "kiwi":                 [{item:"Kiwi (de estación)", qty:1, unit:"unidades", category:"🍎 Frutas"}],
+  "frutillas":            [{item:"Frutillas", qty:80, unit:"g", category:"🍎 Frutas"}],
+  "almendras":            [{item:"Almendras", qty:10, unit:"g", category:"🌾 Cereales y secos"}],
+  "nueces":               [{item:"Nueces", qty:10, unit:"g", category:"🌾 Cereales y secos"}],
+  "huevo_duro":           [{item:"Huevos", qty:1, unit:"unidades", category:"🥩 Proteínas"}],
+  "rollito_jamon_queso":  [{item:"Jamón cocido natural", qty:20, unit:"g", category:"🥩 Proteínas"}, {item:"Queso port salut light", qty:20, unit:"g", category:"🥩 Proteínas"}],
+  "yogur":                [{item:"Yogur descremado", qty:1, unit:"unidades", category:"🥛 Lácteos adultos"}],
+  "gelatina":             [{item:"Gelatina light", qty:0.5, unit:"sobres", category:"🥛 Lácteos adultos"}],
+  "chia":                 [{item:"Semillas de chía", qty:5, unit:"g", category:"🌾 Cereales y secos"}],
+  "lino":                 [{item:"Semillas de lino", qty:5, unit:"g", category:"🌾 Cereales y secos"}],
+
+  // Proteínas principales (almuerzo / cena)
+  "pollo_pechuga":        [{item:"Pechugas de pollo", qty:200, unit:"g", category:"🥩 Proteínas"}],
+  "pollo_pata_muslo":     [{item:"Patas y muslos de pollo", qty:200, unit:"g", category:"🥩 Proteínas"}],
+  "pollo_milanesa":       [{item:"Pechugas de pollo", qty:180, unit:"g", category:"🥩 Proteínas"}, {item:"Huevos", qty:0.5, unit:"unidades", category:"🥩 Proteínas"}, {item:"Avena instantánea", qty:20, unit:"g", category:"🌾 Cereales y secos"}],
+  "pollo_arroz":          [{item:"Pechugas de pollo", qty:150, unit:"g", category:"🥩 Proteínas"}, {item:"Arroz yamaní", qty:50, unit:"g", category:"🌾 Cereales y secos"}],
+  "pollo_hamburguesa":    [{item:"Pollo picado (hamburguesas)", qty:125, unit:"g", category:"🥩 Proteínas"}, {item:"Huevos", qty:0.25, unit:"unidades", category:"🥩 Proteínas"}],
+  "carne_picada":         [{item:"Carne picada magra", qty:150, unit:"g", category:"🥩 Proteínas"}],
+  "carne_bife":           [{item:"Bife magro (cuadril/lomo)", qty:200, unit:"g", category:"🥩 Proteínas"}],
+  "carne_colita":         [{item:"Colita de cuadril", qty:200, unit:"g", category:"🥩 Proteínas"}],
+  "carne_asado":          [{item:"Vacío desgrasado (asado)", qty:200, unit:"g", category:"🥩 Proteínas"}],
+  "merluza":              [{item:"Filet de merluza", qty:175, unit:"g", category:"🥩 Proteínas"}],
+  "merluza_empanizada":   [{item:"Filet de merluza", qty:175, unit:"g", category:"🥩 Proteínas"}, {item:"Avena instantánea", qty:20, unit:"g", category:"🌾 Cereales y secos"}, {item:"Huevos", qty:0.5, unit:"unidades", category:"🥩 Proteínas"}],
+  "salmon":               [{item:"Salmón fresco", qty:150, unit:"g", category:"🥩 Proteínas"}],
+  "atun":                 [{item:"Atún al natural", qty:0.5, unit:"latas", category:"🥩 Proteínas"}],
+  "tortilla_espinaca":    [{item:"Huevos", qty:1.5, unit:"unidades", category:"🥩 Proteínas"}, {item:"Espinaca fresca", qty:80, unit:"g", category:"🥬 Verduras"}, {item:"Queso rallado", qty:15, unit:"g", category:"🍼 Bebé (lácteos enteros)"}],
+  "souffle_espinaca":     [{item:"Huevos", qty:1.5, unit:"unidades", category:"🥩 Proteínas"}, {item:"Espinaca fresca", qty:100, unit:"g", category:"🥬 Verduras"}, {item:"Queso untable desc.", qty:25, unit:"g", category:"🥩 Proteínas"}],
+  "souffle_calabaza":     [{item:"Calabaza anco", qty:200, unit:"g", category:"🥬 Verduras"}, {item:"Huevos", qty:1.5, unit:"unidades", category:"🥩 Proteínas"}, {item:"Queso untable desc.", qty:25, unit:"g", category:"🥩 Proteínas"}],
+  "zapallitos_rellenos":  [{item:"Zapallitos", qty:300, unit:"g", category:"🥬 Verduras"}, {item:"Carne picada magra", qty:150, unit:"g", category:"🥩 Proteínas"}],
+  "calabaza_rellena":     [{item:"Calabaza anco", qty:400, unit:"g", category:"🥬 Verduras"}, {item:"Carne picada magra", qty:150, unit:"g", category:"🥩 Proteínas"}, {item:"Espinaca fresca", qty:30, unit:"g", category:"🥬 Verduras"}],
+  "omelette_champi_ricotta": [{item:"Huevos", qty:2, unit:"unidades", category:"🥩 Proteínas"}, {item:"Champiñones", qty:80, unit:"g", category:"🥬 Verduras"}, {item:"Ricotta descremada", qty:40, unit:"g", category:"🥩 Proteínas"}],
+  "budin_pollo_puerro":   [{item:"Pechugas de pollo", qty:130, unit:"g", category:"🥩 Proteínas"}, {item:"Puerro", qty:50, unit:"g", category:"🥬 Verduras"}, {item:"Huevos", qty:1, unit:"unidades", category:"🥩 Proteínas"}],
+  "lentejas":             [{item:"Lentejas", qty:80, unit:"g", category:"🌾 Cereales y secos"}, {item:"Cebollas", qty:0.5, unit:"unidades", category:"🥬 Verduras"}, {item:"Morrones (mix colores)", qty:0.5, unit:"unidades", category:"🥬 Verduras"}, {item:"Zanahorias", qty:1, unit:"unidades", category:"🥬 Verduras"}],
+  "garbanzos":            [{item:"Garbanzos cocidos", qty:0.5, unit:"latas", category:"🌾 Cereales y secos"}],
+
+  // Guarniciones / cereales
+  "arroz_yamani":         [{item:"Arroz yamaní", qty:50, unit:"g", category:"🌾 Cereales y secos"}],
+  "quinoa":               [{item:"Quinoa", qty:50, unit:"g", category:"🌾 Cereales y secos"}],
+  "couscous":             [{item:"Cous-cous", qty:50, unit:"g", category:"🌾 Cereales y secos"}],
+  "papa":                 [{item:"Papa", qty:200, unit:"g", category:"🥬 Verduras"}],
+  "batata":               [{item:"Batata", qty:200, unit:"g", category:"🥬 Verduras"}],
+  "pure_papa":            [{item:"Papa", qty:200, unit:"g", category:"🥬 Verduras"}],
+  "pure_calabaza":        [{item:"Calabaza anco", qty:250, unit:"g", category:"🥬 Verduras"}],
+  "choclo":               [{item:"Choclo (fresco/congelado)", qty:80, unit:"g", category:"🥬 Verduras"}],
+
+  // Ensaladas/verduras genericas
+  "ensalada_verde":       [{item:"Lechuga variada", qty:60, unit:"g", category:"🥬 Verduras"}, {item:"Tomates redondos", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "ensalada_rucula":      [{item:"Rúcula", qty:40, unit:"g", category:"🥬 Verduras"}, {item:"Tomates redondos", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "ensalada_espinaca":    [{item:"Espinaca fresca", qty:50, unit:"g", category:"🥬 Verduras"}, {item:"Tomates redondos", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "brocoli":              [{item:"Brócoli", qty:80, unit:"g", category:"🥬 Verduras"}],
+  "hinojo":               [{item:"Hinojo (de estación)", qty:80, unit:"g", category:"🥬 Verduras"}],
+  "zanahoria":            [{item:"Zanahorias", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "tomate":               [{item:"Tomates redondos", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "morron":               [{item:"Morrones (mix colores)", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "remolacha":            [{item:"Remolacha", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "pepino":               [{item:"Pepinos", qty:0.5, unit:"unidades", category:"🥬 Verduras"}],
+  "palta":                [{item:"Palta (de estación)", qty:0.25, unit:"unidades", category:"🍎 Frutas"}],
+  "vegetales_grillados":  [{item:"Zucchini", qty:0.5, unit:"unidades", category:"🥬 Verduras"}, {item:"Morrones (mix colores)", qty:0.5, unit:"unidades", category:"🥬 Verduras"}, {item:"Berenjena", qty:0.3, unit:"unidades", category:"🥬 Verduras"}],
+  "vegetales_vapor":      [{item:"Calabaza anco", qty:100, unit:"g", category:"🥬 Verduras"}, {item:"Zanahorias", qty:0.5, unit:"unidades", category:"🥬 Verduras"}, {item:"Brócoli", qty:50, unit:"g", category:"🥬 Verduras"}],
+  "champis":              [{item:"Champiñones", qty:50, unit:"g", category:"🥬 Verduras"}],
+};
+
+// Función que parsea el texto de una comida y devuelve los ingredientes con cantidades
+function parseMealIngredients(text) {
+  const t = text.toLowerCase();
+  const matches = new Set();
+
+  // Mapa de keywords → dish keys (priorizamos los matches más específicos primero)
+  const patterns = [
+    // Desayunos / colaciones específicos
+    ["pancake de avena", "pancake_avena"],
+    ["yogur firme", "yogur_firme"],
+    ["yogur descremado + frutillas", "yogur_frutillas"],
+    ["yogur desc. + frutillas", "yogur_frutillas"],
+    ["yogur desc. firme", "yogur_firme"],
+    ["tostadas con palta", "tostadas_palta"],
+    ["tostadas integrales + queso port salut + jamón", "tostadas_jamon_queso"],
+    ["tostadas integrales + queso port salut", "tostadas_jamon_queso"],
+    ["tostadas integrales", "tostadas_integrales"],
+    ["omelette de espinaca", "omelette_espinaca"],
+    ["omelette de espinaca y queso", "omelette_espinaca"],
+    ["omelette con jamón", "omelette_jamon"],
+    ["omelette con champiñones y queso", "omelette_champis"],
+    ["omelette con champiñones", "omelette_champis"],
+    ["omelette de champiñones y ricotta", "omelette_champi_ricotta"],
+    ["huevos a la plancha", "huevos_revueltos"],
+    ["huevos revueltos + palta", "huevos_palta"],
+    ["huevos revueltos + tomate + palta", "huevos_palta"],
+    ["huevos revueltos", "huevos_revueltos"],
+
+    // Platos principales
+    ["pechuga grillada", "pollo_pechuga"],
+    ["pechugas de pollo", "pollo_pechuga"],
+    ["pata y muslo", "pollo_pata_muslo"],
+    ["milanesa de pollo", "pollo_milanesa"],
+    ["milanesas de pollo", "pollo_milanesa"],
+    ["arroz con pollo", "pollo_arroz"],
+    ["hamburguesas caseras de pollo", "pollo_hamburguesa"],
+    ["budín de pollo y puerro", "budin_pollo_puerro"],
+    ["zapallitos rellenos con pollo", "zapallitos_rellenos"],
+    ["zapallitos rellenos con carne", "zapallitos_rellenos"],
+    ["calabaza rellena", "calabaza_rellena"],
+    ["colita de cuadril", "carne_colita"],
+    ["bife de cuadril a la plancha", "carne_bife"],
+    ["bife a la parrilla", "carne_bife"],
+    ["asado magro", "carne_asado"],
+    ["vacío desgrasado", "carne_asado"],
+    ["filet de merluza empanizada", "merluza_empanizada"],
+    ["filet de merluza empanado", "merluza_empanizada"],
+    ["filet de merluza al horno", "merluza"],
+    ["filet de merluza a la plancha", "merluza"],
+    ["filet de merluza", "merluza"],
+    ["merluza", "merluza"],
+    ["salmón al horno", "salmon"],
+    ["salmón grillado", "salmon"],
+    ["salmón", "salmon"],
+    ["ensalada de atún", "atun"],
+    ["ensalada completa", "atun"],
+    ["atún", "atun"],
+    ["tortilla de espinaca", "tortilla_espinaca"],
+    ["soufflé de espinaca", "souffle_espinaca"],
+    ["soufflé de calabaza", "souffle_calabaza"],
+    ["lentejas guisadas", "lentejas"],
+    ["garbanzos cocidos", "garbanzos"],
+
+    // Cereales / guarniciones
+    ["arroz yamaní", "arroz_yamani"],
+    ["quinoa", "quinoa"],
+    ["cous-cous", "couscous"],
+    ["puré de papa", "pure_papa"],
+    ["puré de calabaza", "pure_calabaza"],
+    ["papa al horno", "papa"],
+    ["papa hervida", "papa"],
+    ["batata al horno", "batata"],
+    ["batata", "batata"],
+    ["choclo desgranado", "choclo"],
+    ["choclo", "choclo"],
+
+    // Verduras / ensaladas
+    ["ensalada espinaca", "ensalada_espinaca"],
+    ["ensalada de espinaca", "ensalada_espinaca"],
+    ["ensalada rúcula", "ensalada_rucula"],
+    ["ensalada de rúcula", "ensalada_rucula"],
+    ["ensalada verde", "ensalada_verde"],
+    ["ensalada de lechuga", "ensalada_verde"],
+    ["ensalada de hojas verdes", "ensalada_verde"],
+    ["ensalada hojas verdes", "ensalada_verde"],
+    ["vegetales a la parrilla", "vegetales_grillados"],
+    ["vegetales grillados", "vegetales_grillados"],
+    ["vegetales al vapor", "vegetales_vapor"],
+    ["brócoli", "brocoli"],
+    ["hinojo", "hinojo"],
+    ["champiñones", "champis"],
+
+    // Frutas / snacks puntuales
+    ["manzana", "manzana"],
+    ["mandarina", "mandarina"],
+    ["pera", "pera"],
+    ["kiwi", "kiwi"],
+    ["frutillas", "frutillas"],
+    ["palta", "palta"],
+    ["10 almendras", "almendras"],
+    ["almendras", "almendras"],
+    ["5 nueces", "nueces"],
+    ["nueces", "nueces"],
+    ["huevo duro", "huevo_duro"],
+    ["rollito de jamón y queso", "rollito_jamon_queso"],
+    ["rollito jamón", "rollito_jamon_queso"],
+    ["yogur desc", "yogur"],
+    ["yogur descremado", "yogur"],
+    ["gelatina light", "gelatina"],
+    ["gelatina", "gelatina"],
+    ["chía", "chia"],
+    ["lino", "lino"],
+  ];
+
+  // Aplicamos los patrones (greedy: el primero que matcheó tiene prioridad)
+  for (const [needle, dishKey] of patterns) {
+    if (t.includes(needle) && !matches.has(dishKey)) {
+      matches.add(dishKey);
+    }
+  }
+
+  // Devolvemos los ingredientes agregados
+  const allIngredients = [];
+  for (const dishKey of matches) {
+    if (dishIngredients[dishKey]) {
+      allIngredients.push(...dishIngredients[dishKey]);
+    }
+  }
+  return allIngredients;
+}
+
+// Calcular cantidad total por integrante según objetivo y tipo
+function getPortionMultiplier() {
+  // Sumar "porciones equivalentes a adulto"
+  let total = 0;
+  for (const p of familia) {
+    if (p.tipo === 'adulto' || p.tipo === 'adolescente') total += 1;
+    else if (p.tipo === 'nino') total += 0.7;
+    else if (p.tipo === 'bebe') total += 0.4;
+  }
+  return total || 2; // default 2 si está vacío
+}
+
+// Sumar todos los ingredientes de las comidas seleccionadas
+function aggregateSelectedMealsIngredients() {
+  const multiplier = getPortionMultiplier();
+  // Agrupamos por item (clave: nombre del item + unidad)
+  const totals = {};
+
+  for (const mealId of selectedMeals) {
+    const [wIdx, dIdx, mealKey] = mealId.split('-');
+    const week = semanas[parseInt(wIdx)];
+    if (!week) continue;
+    const day = week.dias[parseInt(dIdx)];
+    if (!day) continue;
+    const text = day[mealKey];
+    if (!text) continue;
+
+    const ings = parseMealIngredients(text);
+    for (const ing of ings) {
+      const key = `${ing.item}|||${ing.unit}|||${ing.category}`;
+      if (!totals[key]) {
+        totals[key] = { item: ing.item, unit: ing.unit, category: ing.category, qty: 0 };
+      }
+      totals[key].qty += ing.qty * multiplier;
+    }
+  }
+
+  return totals;
+}
+
+// Convertir las cantidades agregadas a un formato similar al compras original
+function buildSelectedShoppingList() {
+  const totals = aggregateSelectedMealsIngredients();
+  const byCategory = {};
+
+  // Agrupar por categoría
+  for (const key in totals) {
+    const t = totals[key];
+    if (!byCategory[t.category]) byCategory[t.category] = [];
+    // Formatear cantidad
+    let qtyText;
+    if (t.unit === 'g') {
+      qtyText = t.qty >= 1000 ? `~${(t.qty/1000).toFixed(1)} kg` : `~${Math.ceil(t.qty)} g`;
+    } else if (t.unit === 'ml') {
+      qtyText = t.qty >= 1000 ? `~${(t.qty/1000).toFixed(1)} L` : `~${Math.ceil(t.qty)} ml`;
+    } else if (t.unit === 'unidades') {
+      qtyText = `${Math.ceil(t.qty)} ${t.qty === 1 ? 'unidad' : 'unidades'}`;
+    } else if (t.unit === 'rebanadas') {
+      qtyText = `${Math.ceil(t.qty)} rebanadas`;
+    } else if (t.unit === 'latas') {
+      qtyText = `${Math.ceil(t.qty)} ${t.qty === 1 ? 'lata' : 'latas'}`;
+    } else if (t.unit === 'sobres') {
+      qtyText = `${Math.ceil(t.qty)} ${t.qty === 1 ? 'sobre' : 'sobres'}`;
+    } else {
+      qtyText = `${t.qty.toFixed(1)} ${t.unit}`;
+    }
+    byCategory[t.category].push({
+      nombre: t.item,
+      cantidad: qtyText,
+      cuando: "lunes"  // simplificación: todo va para la próxima compra
+    });
+  }
+
+  // Ordenar cada categoría alfabéticamente
+  for (const cat in byCategory) {
+    byCategory[cat].sort((a, b) => a.nombre.localeCompare(b.nombre));
+  }
+
+  return byCategory;
+}
+
+
 const semanas = [
   { label: "Semana 1", dias: [
       { dia: "Lunes", desayuno: "2 huevos revueltos + 2 tostadas integrales con queso untable + café c/leche desc.", colacion_m: "1 mandarina + 10 almendras", almuerzo: "Pechuga grillada + ensalada espinaca, tomate, zanahoria rallada + arroz yamaní", colacion_t: "Yogur descremado + 1 cda chía", cena: "Zapallitos rellenos con carne picada magra + ensalada verde con palta", cals: 1450 },
@@ -1111,6 +1453,13 @@ const compras = {
 let currentWeek = 0;
 let currentDay = 0;
 let weekFilter = 'all';
+// Comidas seleccionadas: Set de strings "weekIdx-dayIdx-mealKey", ej "0-1-almuerzo"
+let selectedMeals = new Set(JSON.parse(localStorage.getItem('selectedMeals') || '[]'));
+function saveSelectedMeals() {
+  localStorage.setItem('selectedMeals', JSON.stringify([...selectedMeals]));
+}
+// Modo de la lista de compras: 'all' (semana completa) o 'selected' (solo seleccionadas)
+let shoppingMode = localStorage.getItem('shoppingMode') || 'all';
 // checkedItems: Map<string, {status: 'complete'|'partial'|'leftover', note?: string}>
 let checkedItems = (() => {
   const raw = localStorage.getItem('checked');
@@ -1168,13 +1517,36 @@ function renderDay() {
     const text = d[c.key];
     const recipeKeys = findRecipeKeysFor(text);
     const hasRecipe = recipeKeys.length > 0;
+    const mealId = `${currentWeek}-${currentDay}-${c.key}`;
+    const isSelected = selectedMeals.has(mealId);
+    // Construir handler para abrir receta (en el body de la card, no en el checkbox)
     const handler = hasRecipe ? `onclick='openMealRecipes(${JSON.stringify(recipeKeys)}, ${JSON.stringify(c.label)})'` : '';
-    html += `<div class="meal-card ${hasRecipe ? 'has-recipe' : ''}" ${handler}>
-      <div class="meal-head"><span class="meal-tag">${c.label}</span></div>
-      <div class="meal-text">${text}</div>
+    html += `<div class="meal-card-wrapper">
+      <button class="meal-select-btn ${isSelected ? 'selected' : ''}" onclick="toggleMealSelected('${mealId}', event)" title="Agregar a mis compras" aria-label="${isSelected ? 'Quitar de compras' : 'Agregar a compras'}">
+        ${isSelected ? '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6l3 3 5-6" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' : '+'}
+      </button>
+      <div class="meal-card ${hasRecipe ? 'has-recipe' : ''} ${isSelected ? 'meal-selected' : ''}" ${handler}>
+        <div class="meal-head"><span class="meal-tag">${c.label}</span></div>
+        <div class="meal-text">${text}</div>
+      </div>
     </div>`;
   });
   document.getElementById('menu-content').innerHTML = html;
+}
+
+function toggleMealSelected(mealId, event) {
+  if (event) event.stopPropagation();
+  if (selectedMeals.has(mealId)) {
+    selectedMeals.delete(mealId);
+  } else {
+    selectedMeals.add(mealId);
+  }
+  saveSelectedMeals();
+  renderDay();
+  // Si está visible la pestaña de compras, refrescar
+  if (document.getElementById('compras').classList.contains('active')) {
+    renderCompras();
+  }
 }
 
 function renderWeek() {
@@ -1188,11 +1560,38 @@ function prevWeek() { if (currentWeek > 0) { currentWeek--; currentDay = 0; rend
 function nextWeek() { if (currentWeek < semanas.length - 1) { currentWeek++; currentDay = 0; renderWeek(); } }
 
 function renderCompras() {
+  // Update badge with count
+  const badge = document.getElementById('selected-count-badge');
+  if (badge) {
+    badge.textContent = selectedMeals.size > 0 ? `(${selectedMeals.size})` : '';
+  }
+
+  // Decide qué lista usar
+  let comprasData;
+  if (shoppingMode === 'selected') {
+    if (selectedMeals.size === 0) {
+      document.getElementById('compras-content').innerHTML = `
+        <div class="empty">
+          <p style="font-size:14px;line-height:1.6;color:var(--text-2);margin-bottom:14px">No tenés comidas seleccionadas todavía.</p>
+          <p style="font-size:12px;color:var(--text-3);line-height:1.5">Andá a la pestaña <strong>Menú</strong> y tocá el botón + al lado de cada comida que querés agregar a tu lista. O usá el botón "Agregar comidas" de arriba.</p>
+        </div>
+      `;
+      renderSelectedMealsSummary();
+      return;
+    }
+    comprasData = buildSelectedShoppingList();
+    renderSelectedMealsSummary();
+  } else {
+    comprasData = compras;
+  }
+
   let html = '';
   const colors = ['#A32D2D','#3B6D11','#854F0B','#185FA5','#7F77DD','#0F6E56','#5F5E5A'];
   let ci = 0;
-  Object.entries(compras).forEach(([cat, items]) => {
-    const filtered = weekFilter === 'all' ? items : items.filter(i => i.cuando === weekFilter);
+  Object.entries(comprasData).forEach(([cat, items]) => {
+    const filtered = shoppingMode === 'all' && weekFilter !== 'all'
+      ? items.filter(i => i.cuando === weekFilter)
+      : items;
     if (filtered.length === 0) { ci++; return; }
     const checkedCount = filtered.filter((it) => {
       const realIdx = items.indexOf(it);
@@ -1205,14 +1604,12 @@ function renderCompras() {
         <span class="compras-count">${checkedCount}/${filtered.length}</span>
       </div>`;
     items.forEach((it, idx) => {
-      if (weekFilter !== 'all' && it.cuando !== weekFilter) return;
-      const key = `${cat}-${idx}`;
+      if (shoppingMode === 'all' && weekFilter !== 'all' && it.cuando !== weekFilter) return;
+      const key = `${cat}-${idx}-${shoppingMode}`;  // key distinta para que no se mezcle entre modos
       const checkedData = checkedItems.get(key);
-      const checked = !!checkedData;
       const status = checkedData?.status || null;
       const seasonInfo = isInSeason(it.nombre);
       const seasonBadge = (seasonInfo && seasonInfo.peak) ? '<span class="season-marker">de estación</span>' : '';
-      // Status icon and color
       let statusBadge = '';
       let cardClass = 'compra-item';
       let checkIcon = '';
@@ -1230,6 +1627,7 @@ function renderCompras() {
         checkIcon = '<span style="color:white;font-size:11px;font-weight:700">+</span>';
       }
       const noteText = checkedData?.note ? `<div class="compra-note">${checkedData.note}</div>` : '';
+      const whenText = shoppingMode === 'selected' ? 'List' : (it.cuando === 'jueves' ? 'Jue' : 'Lun');
       html += `<div class="${cardClass}" onclick="openCompraStatusModal('${key.replace(/'/g,"\\'")}', ${JSON.stringify(it.nombre).replace(/"/g,'&quot;')}, ${JSON.stringify(it.cantidad).replace(/"/g,'&quot;')})">
         <div class="check-box">${checkIcon}</div>
         <div class="compra-text">
@@ -1237,13 +1635,125 @@ function renderCompras() {
           <div class="compra-cantidad">${it.cantidad}</div>
           ${noteText}
         </div>
-        <span class="compra-when">${it.cuando === 'jueves' ? 'Jue' : 'Lun'}</span>
+        <span class="compra-when">${whenText}</span>
       </div>`;
     });
     html += `</div>`;
     ci++;
   });
   document.getElementById('compras-content').innerHTML = html;
+}
+
+function setShoppingMode(mode) {
+  shoppingMode = mode;
+  localStorage.setItem('shoppingMode', mode);
+  document.querySelectorAll('.mode-btn[data-shop-mode]').forEach(b => {
+    b.classList.toggle('active', b.dataset.shopMode === mode);
+  });
+  document.getElementById('all-mode-content').style.display = mode === 'all' ? 'block' : 'none';
+  document.getElementById('selected-mode-content').style.display = mode === 'selected' ? 'block' : 'none';
+  renderCompras();
+}
+
+function renderSelectedMealsSummary() {
+  const container = document.getElementById('selected-meals-summary');
+  if (!container) return;
+  if (selectedMeals.size === 0) {
+    container.innerHTML = '<p style="font-size:12px;color:var(--text-3);font-style:italic">Ninguna comida seleccionada todavía.</p>';
+    return;
+  }
+  // Agrupar por semana
+  const byWeek = {};
+  for (const mealId of selectedMeals) {
+    const [w, d, k] = mealId.split('-');
+    const wi = parseInt(w), di = parseInt(d);
+    const week = semanas[wi];
+    if (!week) continue;
+    const day = week.dias[di];
+    if (!day) continue;
+    if (!byWeek[wi]) byWeek[wi] = {};
+    if (!byWeek[wi][di]) byWeek[wi][di] = [];
+    const mealLabel = {desayuno:'Des', colacion_m:'Col M', almuerzo:'Alm', colacion_t:'Col T', cena:'Cena'}[k];
+    byWeek[wi][di].push(mealLabel);
+  }
+
+  let html = '';
+  Object.keys(byWeek).sort().forEach(wi => {
+    html += `<div style="margin-bottom:6px"><strong style="font-size:12px;color:var(--text-2)">${semanas[wi].label}:</strong>`;
+    html += '<div style="font-size:12px;color:var(--text-3);margin-top:2px;line-height:1.6">';
+    Object.keys(byWeek[wi]).sort().forEach(di => {
+      const dayName = semanas[wi].dias[di].dia.slice(0,3);
+      const meals = byWeek[wi][di].join(', ');
+      html += `<div>• ${dayName}: ${meals}</div>`;
+    });
+    html += '</div></div>';
+  });
+  container.innerHTML = html;
+}
+
+function clearAllSelectedMeals() {
+  if (selectedMeals.size === 0) return;
+  if (!confirm(`¿Quitar todas las ${selectedMeals.size} comidas seleccionadas?`)) return;
+  selectedMeals.clear();
+  saveSelectedMeals();
+  renderCompras();
+  if (document.getElementById('menu').classList.contains('active')) {
+    renderDay();
+  }
+  showToast('✓ Limpiado');
+}
+
+function openSelectedMealsManager() {
+  // Modal que muestra todas las comidas con checkboxes
+  let html = '<h2 style="font-size:18px;font-weight:600;margin-bottom:4px">Agregar / Quitar comidas</h2>';
+  html += '<p style="font-size:12px;color:var(--text-3);margin-bottom:14px">Tocá las comidas para agregarlas o quitarlas de tu lista.</p>';
+
+  const mealOrder = [
+    {k:'desayuno', l:'Desayuno'},
+    {k:'colacion_m', l:'Media mañana'},
+    {k:'almuerzo', l:'Almuerzo'},
+    {k:'colacion_t', l:'Media tarde'},
+    {k:'cena', l:'Cena'}
+  ];
+
+  semanas.forEach((week, wi) => {
+    html += `<div class="section-divider" style="margin-top:14px">${week.label}</div>`;
+    week.dias.forEach((day, di) => {
+      html += `<div style="margin-bottom:10px"><div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:4px">${day.dia}</div>`;
+      mealOrder.forEach(m => {
+        const id = `${wi}-${di}-${m.k}`;
+        const sel = selectedMeals.has(id);
+        const text = day[m.k];
+        const shortText = text.length > 60 ? text.slice(0, 60) + '…' : text;
+        html += `<div class="meal-manager-row ${sel ? 'selected' : ''}" onclick="toggleMealSelectedFromModal('${id}')">
+          <div class="meal-manager-check">${sel ? '✓' : ''}</div>
+          <div class="meal-manager-info">
+            <div class="meal-manager-tag">${m.l}</div>
+            <div class="meal-manager-text">${shortText}</div>
+          </div>
+        </div>`;
+      });
+      html += '</div>';
+    });
+  });
+
+  html += '<button class="btn btn-primary" onclick="closeModal()" style="width:100%;margin-top:14px">Listo</button>';
+
+  document.getElementById('modal-content').innerHTML = html;
+  document.getElementById('modal').classList.add('show');
+  document.body.style.overflow = 'hidden';
+}
+
+function toggleMealSelectedFromModal(mealId) {
+  if (selectedMeals.has(mealId)) {
+    selectedMeals.delete(mealId);
+  } else {
+    selectedMeals.add(mealId);
+  }
+  saveSelectedMeals();
+  // Re-render the modal in place
+  openSelectedMealsManager();
+  renderCompras();
 }
 
 function openCompraStatusModal(key, nombre, cantidad) {
@@ -2490,6 +3000,8 @@ const SYNC_KEYS = [
   'lastRegen',         // fecha de última regeneración
   'selectedBanks',     // bancos seleccionados en descuentos
   'selectedMarkets',   // supermercados seleccionados
+  'selectedMeals',     // comidas del menú seleccionadas para la lista
+  'shoppingMode',      // modo de la lista de compras
 ];
 
 // Construir el snapshot del estado actual desde localStorage
@@ -2534,6 +3046,8 @@ function applyRemoteSnapshot(data) {
     regenSelected = new Set(JSON.parse(localStorage.getItem('regenSelected') || '[]'));
     selectedBanks = new Set(JSON.parse(localStorage.getItem('selectedBanks') || '["bna","galicia","ciudad","cuentadni","santander","icbc","bbva"]'));
     selectedMarkets = new Set(JSON.parse(localStorage.getItem('selectedMarkets') || '["coto","dia","carrefour","disco","jumbo","mayorista"]'));
+    selectedMeals = new Set(JSON.parse(localStorage.getItem('selectedMeals') || '[]'));
+    shoppingMode = localStorage.getItem('shoppingMode') || 'all';
     // Refrescar UI
     renderCompras();
     renderFamilyList();
@@ -2543,6 +3057,7 @@ function applyRemoteSnapshot(data) {
     renderRegenChips();
     renderRegenStatus();
     renderDiscountsAll();
+    if (document.getElementById('menu').classList.contains('active')) renderDay();
     updatePromptPreview();
     if (typeof updatePlanPreview === 'function') updatePlanPreview();
     syncLastSync = new Date();
@@ -3049,361 +3564,4 @@ function renderDiscountsAll() {
 
 async function callAI(prompt, onChunk) {
   // Endpoint relativo: funciona en Netlify deploy real
-  const endpoint = '/.netlify/functions/regenerar';
-  let response;
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, sessionId: syncSessionId })
-    });
-  } catch (networkErr) {
-    throw new Error(`No hay conexión a internet o el servidor no responde. Detalle: ${networkErr.message}`);
-  }
-
-  // Detectar 404
-  if (response.status === 404) {
-    throw new Error(`La función /.netlify/functions/regenerar no existe en el servidor (404). Verificá que la carpeta netlify/functions/regenerar.js esté en el repo.`);
-  }
-
-  // Si no es OK y NO es streaming, viene un error JSON
-  if (!response.ok) {
-    let errMsg = `HTTP ${response.status}`;
-    let errDetails = '';
-    try {
-      const errData = await response.json();
-      errMsg = errData.error || errMsg;
-      errDetails = errData.details ? ` (${errData.details})` : '';
-    } catch (parseErr) {
-      try {
-        const text = await response.text();
-        if (text) errMsg += `: ${text.slice(0, 200)}`;
-      } catch {}
-    }
-    throw new Error(errMsg + errDetails);
-  }
-
-  // Procesar el stream NDJSON (newline-delimited JSON)
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let fullText = '';
-  let usage = null;
-  let streamError = null;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
-        if (event.type === 'delta') {
-          fullText += event.text;
-          if (onChunk) onChunk(fullText, event.text);
-        } else if (event.type === 'done') {
-          usage = event.usage;
-        } else if (event.type === 'error') {
-          streamError = event.error;
-        }
-      } catch (parseErr) {
-        console.warn('Could not parse line:', line);
-      }
-    }
-  }
-
-  if (streamError) {
-    throw new Error('Error durante el streaming: ' + streamError);
-  }
-
-  return { content: fullText, usage };
-}
-
-// Mostrar UI de progreso (con área para texto en streaming)
-function showAIProgress(title, subtitle) {
-  const html = `
-    <h2 style="font-size:18px;font-weight:600;margin-bottom:4px">${title}</h2>
-    <p style="font-size:12px;color:var(--text-3);margin-bottom:14px">${subtitle}</p>
-    <div class="ai-progress" id="ai-progress-bar">
-      <div class="spinner"></div>
-      <div class="ai-progress-text">Esperando respuesta de Claude…<br><span style="font-size:11px;font-weight:400;opacity:0.8" id="ai-progress-meta">Conectando…</span></div>
-    </div>
-    <div class="ai-response-content" id="ai-stream-text" style="display:none;max-height:50vh"></div>
-  `;
-  document.getElementById('modal-content').innerHTML = html;
-  document.getElementById('modal').classList.add('show');
-  document.body.style.overflow = 'hidden';
-}
-
-// Actualizar el texto que llega por streaming
-function updateAIStream(fullText) {
-  const el = document.getElementById('ai-stream-text');
-  const meta = document.getElementById('ai-progress-meta');
-  if (!el) return;
-  if (el.style.display === 'none') {
-    el.style.display = 'block';
-  }
-  el.textContent = fullText;
-  // Auto-scroll al final
-  el.scrollTop = el.scrollHeight;
-  // Actualizar meta con cantidad de caracteres
-  if (meta) {
-    meta.textContent = `Recibiendo… ${fullText.length} caracteres`;
-  }
-}
-
-// Mostrar respuesta de la IA
-function showAIResponse(title, content, opts = {}) {
-  const usage = opts.usage;
-  const meta = usage
-    ? `Modelo: claude-sonnet-4-6 · ${usage.input_tokens} tokens entrada · ${usage.output_tokens} tokens salida · ~$${estimateCost(usage)}`
-    : '';
-  const html = `
-    <div class="ai-response-modal">
-      <h2>${title}</h2>
-      ${meta ? `<div class="ai-response-meta">${meta}</div>` : ''}
-      <div class="ai-response-content" id="ai-response-text">${escapeHtml(content)}</div>
-      <div class="ai-response-actions">
-        <button class="btn btn-primary" onclick="copyAIResponse()">📋 Copiar respuesta completa</button>
-        ${opts.onApply ? `<button class="btn btn-primary" id="apply-ai-btn">${opts.applyLabel || '✓ Aplicar a la app'}</button>` : ''}
-        <button class="btn" onclick="closeModal()">Cerrar</button>
-      </div>
-    </div>
-  `;
-  document.getElementById('modal-content').innerHTML = html;
-  document.getElementById('modal').classList.add('show');
-  document.body.style.overflow = 'hidden';
-  if (opts.onApply) {
-    document.getElementById('apply-ai-btn').onclick = opts.onApply;
-  }
-}
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-function copyAIResponse() {
-  const text = document.getElementById('ai-response-text')?.textContent || '';
-  navigator.clipboard.writeText(text).then(() => {
-    showToast('✓ Respuesta copiada');
-  }).catch(() => {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-    showToast('✓ Copiado');
-  });
-}
-
-// Estimar costo en USD basado en pricing de Sonnet 4.6 ($3/M input, $15/M output)
-function estimateCost(usage) {
-  if (!usage) return '0';
-  const cost = (usage.input_tokens * 3 / 1_000_000) + (usage.output_tokens * 15 / 1_000_000);
-  return cost.toFixed(3);
-}
-
-// === Acciones específicas ===
-
-async function autoRegenerate() {
-  if (familia.length === 0) {
-    showToast('Configurá al menos 1 integrante en Familia');
-    return;
-  }
-  const btn = document.getElementById('auto-regen-btn');
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Generando…';
-  }
-  showAIProgress('🔄 Regenerando menú', 'Claude va a generar 2 semanas de menú nuevo según tus preferencias.');
-  try {
-    const prompt = buildPrompt();
-    const result = await callAI(prompt, (fullText) => {
-      updateAIStream(fullText);
-    });
-    showAIResponse('🍽️ Menú nuevo generado', result.content, {
-      usage: result.usage,
-      applyLabel: '✓ Marcar como regenerado',
-      onApply: () => {
-        markRegenerated();
-        closeModal();
-      }
-    });
-  } catch (err) {
-    showAIError('regenerar el menú', err);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '⚡ Regenerar automático';
-    }
-  }
-}
-
-async function autoPlan() {
-  if (familia.length === 0) {
-    showToast('Configurá al menos 1 integrante en Familia');
-    return;
-  }
-  if ([...pantry, ...pantryExtras].length === 0) {
-    if (!confirm('No marcaste ingredientes en "¿Qué hay?". Claude no va a saber qué tenés en casa. ¿Continuar igual?')) return;
-  }
-  const btn = document.getElementById('auto-plan-btn');
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Generando…';
-  }
-  showAIProgress('📅 Armando plan semanal', 'Claude va a armar 7 días con lo que tenés en casa.');
-  try {
-    const prompt = buildPlanPrompt();
-    const result = await callAI(prompt, (fullText) => {
-      updateAIStream(fullText);
-    });
-    showAIResponse('📅 Plan semanal con tus ingredientes', result.content, { usage: result.usage });
-  } catch (err) {
-    showAIError('armar el plan semanal', err);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '⚡ Generar plan automático';
-    }
-  }
-}
-
-async function autoCombinar() {
-  if ([...pantry, ...pantryExtras].length === 0) {
-    showToast('Marcá al menos algunos ingredientes primero');
-    return;
-  }
-  const btn = document.getElementById('auto-combinar-btn');
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Generando…';
-  }
-  showAIProgress('✨ Inventando receta', 'Claude va a combinar tus ingredientes en una receta nueva.');
-  try {
-    const prompt = buildCombinarPrompt();
-    const result = await callAI(prompt, (fullText) => {
-      updateAIStream(fullText);
-    });
-    showAIResponse('✨ Receta nueva con lo que tenés', result.content, { usage: result.usage });
-  } catch (err) {
-    showAIError('crear la receta', err);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '⚡ Generar receta automática';
-    }
-  }
-}
-
-function showAIError(action, err) {
-  const msg = err.message || 'Error desconocido';
-  const isNetwork = msg.includes('fetch') || msg.includes('Network') || msg.includes('Failed');
-  const isAPI = msg.includes('API') || msg.includes('saldo') || msg.includes('key');
-
-  let helpText = '';
-  if (isNetwork) {
-    helpText = `<p style="font-size:13px;color:var(--text-2);line-height:1.5;margin-top:10px">Problema de conexión. Esto puede pasar si:</p>
-      <ul style="font-size:13px;color:var(--text-2);line-height:1.7;padding-left:20px">
-        <li>No hay internet</li>
-        <li>La app está corriendo localmente (sin Netlify deploy)</li>
-        <li>Las Netlify Functions no están configuradas</li>
-      </ul>`;
-  } else if (isAPI) {
-    helpText = `<p style="font-size:13px;color:var(--text-2);line-height:1.5;margin-top:10px">Problema con la API de Anthropic. Verificá:</p>
-      <ul style="font-size:13px;color:var(--text-2);line-height:1.7;padding-left:20px">
-        <li>Tu API key está bien configurada en Netlify (variable ANTHROPIC_API_KEY)</li>
-        <li>Tenés saldo en console.anthropic.com</li>
-        <li>La key no expiró o fue revocada</li>
-      </ul>`;
-  }
-
-  const html = `
-    <h2 style="font-size:18px;font-weight:600;margin-bottom:8px;color:var(--danger-text)">⚠️ Error al ${action}</h2>
-    <div style="background:var(--danger-bg);color:var(--danger-text);padding:12px;border-radius:var(--radius);font-size:13px;line-height:1.5">${escapeHtml(msg)}</div>
-    ${helpText}
-    <p style="font-size:12px;color:var(--text-3);margin-top:14px;line-height:1.5">Mientras tanto, podés usar el botón "📋 Copiar" para usar el prompt manualmente en Claude.ai.</p>
-    <button class="btn" onclick="closeModal()" style="width:100%;margin-top:14px">Cerrar</button>
-  `;
-  document.getElementById('modal-content').innerHTML = html;
-  document.getElementById('modal').classList.add('show');
-  document.body.style.overflow = 'hidden';
-}
-
-
-// Iniciar Firebase cuando esté listo
-function initSync() {
-  // Render UI inicial inmediatamente (no depende de Firebase)
-  renderSyncUI();
-  if (!window.fb) {
-    // Firebase aún no cargó — esperar
-    window.addEventListener('firebase-ready', () => {
-      renderSyncUI();
-      if (syncSessionId) subscribeToSession(syncSessionId);
-    }, { once: true });
-    // Timeout: si en 8 seg no cargó, mostrar mensaje
-    setTimeout(() => {
-      if (!window.fb) {
-        const statusCard = document.getElementById('sync-status-card');
-        if (statusCard && !syncSessionId) {
-          statusCard.className = 'sync-status-card error';
-          statusCard.innerHTML = `<span class="sync-status-icon">⚠️</span><div>No se pudo cargar Firebase. Verificá tu conexión y recargá.</div>`;
-        }
-      }
-    }, 8000);
-    return;
-  }
-  if (syncSessionId) {
-    subscribeToSession(syncSessionId);
-  }
-}
-
-// Refresh UI on connectivity changes
-window.addEventListener('online', renderSyncUI);
-window.addEventListener('offline', renderSyncUI);
-
-// Refresh UI status text every 30 seconds
-setInterval(() => {
-  if (syncSessionId) renderSyncUI();
-}, 30000);
-
-// ================== INIT ==================
-renderRegenChips();
-updatePromptPreview();
-renderRegenStatus();
-renderSeasonBanner();
-renderObjetivoPill();
-renderFamilyList();
-renderPantry();
-renderSuggestions();
-renderDiscountsAll();
-
-renderWeek();
-renderCompras();
-renderRecetas();
-renderBebe();
-
-const today = new Date().getDay();
-const todayMap = [6, 0, 1, 2, 3, 4, 5];
-if (todayMap[today] < 7) {
-  currentDay = todayMap[today];
-  renderDayTabs();
-  renderDay();
-}
-
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
-}
-
-initSync();
-</script>
-</body>
-</html>
+  co
